@@ -7,11 +7,15 @@ import os, sys, logging, io
 
 VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
 
+DEFAULT_ERROR_GCODE = """
+{% if 'heaters' in printer %}
+   TURN_OFF_HEATERS
+{% endif %}
+"""
+
 class VirtualSD:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.printer.register_event_handler("klippy:shutdown",
-                                            self.handle_shutdown)
         # sdcard state
         sd = config.get('path')
         self.sdcard_dirname = os.path.normpath(os.path.expanduser(sd))
@@ -26,8 +30,10 @@ class VirtualSD:
         self.work_timer = None
         # Error handling
         gcode_macro = self.printer.load_object(config, 'gcode_macro')
+        aio = self.printer.load_object(config, 'aio_executor')
+        self.executor = aio.allocate_executor("virtual_sdcard")
         self.on_error_gcode = gcode_macro.load_template(
-            config, 'on_error_gcode', '')
+            config, 'on_error_gcode', DEFAULT_ERROR_GCODE)
         # Register commands
         self.gcode = self.printer.lookup_object('gcode')
         for cmd in ['M20', 'M21', 'M23', 'M24', 'M25', 'M26', 'M27']:
@@ -40,20 +46,32 @@ class VirtualSD:
         self.gcode.register_command(
             "SDCARD_PRINT_FILE", self.cmd_SDCARD_PRINT_FILE,
             desc=self.cmd_SDCARD_PRINT_FILE_help)
-    def handle_shutdown(self):
-        if self.work_timer is not None:
-            self.must_pause_work = True
+        self.printer.register_event_handler("klippy:analyze_shutdown",
+                                            self._handle_analyze_shutdown)
+        self.printer.register_event_handler("gcode:debuginput_exit",
+                                            self._handle_debuginput_exit)
+    def _handle_analyze_shutdown(self, msg, details):
+        if self.work_timer is None:
+            return
+        file_position = self.file_position
+        current_file = self.current_file
+        self.must_pause_work = True
+        def log_debug_data(eventtime):
             try:
-                readpos = max(self.file_position - 1024, 0)
-                readcount = self.file_position - readpos
-                self.current_file.seek(readpos)
-                data = self.current_file.read(readcount + 128)
+                readpos = max(file_position - 1024, 0)
+                readcount = file_position - readpos
+                current_file.seek(readpos)
+                data = current_file.read(readcount + 128)
             except:
                 logging.exception("virtual_sdcard shutdown read")
                 return
             logging.info("Virtual sdcard (%d): %s\nUpcoming (%d): %s",
                          readpos, repr(data[:readcount]),
-                         self.file_position, repr(data[readcount:]))
+                         file_position, repr(data[readcount:]))
+        self.reactor.register_callback(log_debug_data)
+    def _handle_debuginput_exit(self):
+        # When in batch debugging mode, wait until sdcard idle before exiting
+        return self.work_timer is None
     def stats(self, eventtime):
         if self.work_timer is None:
             return False, ""
@@ -177,10 +195,13 @@ class VirtualSD:
             if fname not in flist:
                 fname = files_by_lower[fname.lower()]
             fname = os.path.join(self.sdcard_dirname, fname)
-            f = io.open(fname, 'r', newline='')
+            f = self.executor.submit(io.open, fname, 'rb', buffering=0)
+            f = self.executor.wrap_obj(f)
+            f = io.BufferedReader(f)
             f.seek(0, os.SEEK_END)
             fsize = f.tell()
             f.seek(0)
+            f = io.TextIOWrapper(f, newline='')
         except:
             logging.exception("virtual_sdcard file open")
             raise gcmd.error("Unable to open file")
@@ -253,7 +274,7 @@ class VirtualSD:
                 continue
             # Pause if any other request is pending in the gcode class
             if gcode_mutex.test():
-                self.reactor.pause(self.reactor.monotonic() + 0.100)
+                self.reactor.pause(self.reactor.monotonic() + 0.050)
                 continue
             # Dispatch command
             self.cmd_from_sd = True
